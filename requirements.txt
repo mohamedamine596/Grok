@@ -2,3 +2,5 @@ openai
 requests
 pillow
 flask
+flask-cors
+flask-limiter

@@ -7,12 +7,15 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import argparse
-from flask import Flask, request, jsonify
-
-# You'll need to install these packages:
-# pip install openai requests pillow flask
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 
 from openai import OpenAI
+
+app = Flask(__name__)
+# Enable CORS for all relevant endpoints
+CORS(app, resources={r"/images/*": {"origins": "*"}, r"/generate-image": {"origins": "*"}, r"/health": {"origins": "*"}})
+# Add rate limiting for production
 
 class GrokImageGenerator:
     """Complete Grok 2 Image Generation client"""
@@ -24,18 +27,11 @@ class GrokImageGenerator:
         Args:
             api_key: Your xAI API key. If None, will try to get from XAI_API_KEY environment variable
         """
-        # Replace with your actual API key
-        self.api_key = api_key or "xai-wxr9EEv2LIgSUkUSpUq9j8fWUPoEmxRf5cBXOTj5pzrzlqWwsraw2amkVTVLmXDfViOhdgKLddq08pms"
-        
-        if self.api_key == "xai-YOUR_API_KEY_HERE":
-            # Try to get from environment variable as fallback
-            env_key = os.getenv("XAI_API_KEY")
-            if env_key:
-                self.api_key = env_key
-            else:
-                print("⚠️  Please set your API key in the code or XAI_API_KEY environment variable")
-                print("   Get your API key from: https://console.x.ai/team/api-keys")
-                sys.exit(1)
+        self.api_key = api_key or os.getenv("XAI_API_KEY")
+        if not self.api_key:
+            print("⚠️ Please set your API key via XAI_API_KEY environment variable")
+            print("   Get your API key from: https://console.x.ai/team/api-keys")
+            sys.exit(1)
         
         self.client = OpenAI(
             base_url="https://api.x.ai/v1",
@@ -68,6 +64,17 @@ class GrokImageGenerator:
         Returns:
             Dictionary containing response data and metadata
         """
+        if not prompt:
+            return {
+                'success': False,
+                'error': 'Prompt is required',
+                'original_prompt': '',
+                'count': 0,
+                'images': [],
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        count = max(1, min(count, 10))  # Ensure count is between 1 and 10
         print(f"\n🎨 Generating {count} image(s) with prompt: '{prompt}'")
         
         try:
@@ -89,7 +96,7 @@ class GrokImageGenerator:
             for i, image_data in enumerate(response.data):
                 image_info = {
                     'index': i + 1,
-                    'revised_prompt': image_data.revised_prompt,
+                    'revised_prompt': getattr(image_data, 'revised_prompt', prompt),
                     'url': getattr(image_data, 'url', None),
                     'b64_json': getattr(image_data, 'b64_json', None),
                     'saved_path': None
@@ -97,14 +104,16 @@ class GrokImageGenerator:
                 
                 # Auto-save if requested
                 if save_images:
+                    filename = self._generate_filename(prompt, i + 1, "jpg")
                     if format_type == "url" and image_info['url']:
-                        filename = self._generate_filename(prompt, i + 1, "jpg")
                         if self.save_image_from_url(image_info['url'], filename):
                             image_info['saved_path'] = str(filename)
+                            # Generate URL for the /images endpoint
+                            image_info['url'] = f"http://localhost:8081/images/{filename.name}"
                     elif format_type == "b64_json" and image_info['b64_json']:
-                        filename = self._generate_filename(prompt, i + 1, "jpg")
                         if self.save_image_from_b64(image_info['b64_json'], filename):
                             image_info['saved_path'] = str(filename)
+                            image_info['url'] = f"http://localhost:8081/images/{filename.name}"
                 
                 result['images'].append(image_info)
             
@@ -115,7 +124,10 @@ class GrokImageGenerator:
             error_result = {
                 'success': False,
                 'error': str(e),
-                'original_prompt': prompt
+                'original_prompt': prompt,
+                'count': 0,
+                'images': [],
+                'timestamp': datetime.now().isoformat()
             }
             print(f"❌ Error generating images: {e}")
             return error_result
@@ -138,7 +150,6 @@ class GrokImageGenerator:
     def save_image_from_b64(self, b64_string: str, filename: Path) -> bool:
         """Save base64 encoded image to file"""
         try:
-            # Remove data:image/jpeg;base64, prefix if present
             if b64_string.startswith('data:image'):
                 b64_string = b64_string.split(',', 1)[1]
             
@@ -155,9 +166,8 @@ class GrokImageGenerator:
     
     def _generate_filename(self, prompt: str, index: int, extension: str) -> Path:
         """Generate a safe filename from prompt"""
-        # Clean prompt for filename
         safe_prompt = "".join(c for c in prompt if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_prompt = safe_prompt.replace(' ', '_')[:50]  # Limit length
+        safe_prompt = safe_prompt.replace(' ', '_')[:50]
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{safe_prompt}_{timestamp}_{index:02d}.{extension}"
@@ -173,7 +183,7 @@ class GrokImageGenerator:
         print(f"📝 Original prompt: {result['original_prompt']}")
         
         for img in result['images']:
-            print(f"\n🖼️  Image {img['index']}:")
+            print(f"\n🖼️ Image {img['index']}:")
             print(f"   Revised prompt: {img['revised_prompt']}")
             if img['url']:
                 print(f"   URL: {img['url']}")
@@ -281,7 +291,6 @@ def command_line_mode():
     
     return result
 
-# Predefined example prompts for quick testing
 EXAMPLE_PROMPTS = [
     "A majestic dragon flying over a medieval castle at sunset",
     "A futuristic city with flying cars and neon lights",
@@ -315,66 +324,59 @@ def quick_demo():
     except ValueError:
         print("❌ Please enter a valid number")
 
-# Flask API server code
-app = Flask(__name__)
-
-@app.route('/generate', methods=['POST'])
-def api_generate_images():
+@app.route('/generate-image', methods=['POST'])
+def generate_image():
     """API endpoint to generate images from prompt"""
-    data = request.json
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Request must be JSON"}), 400
+    
+    data = request.get_json()
+    
+    if 'prompt' not in data:
+        return jsonify({"success": False, "error": "Prompt is required"}), 400
     
     prompt = data.get('prompt')
-    count = data.get('count', 1)
+    count = min(max(1, data.get('count', 1)), 10)
     format_type = data.get('format', 'url')
+    if format_type not in ['url', 'b64_json']:
+        format_type = 'url'
+    
     save_images = data.get('save_images', True)
     
-    if not prompt:
-        return jsonify({'success': False, 'error': 'Prompt is required'}), 400
+    generator = GrokImageGenerator()
+    result = generator.generate_images(
+        prompt=prompt,
+        count=count,
+        format_type=format_type,
+        save_images=save_images
+    )
     
+    return jsonify(result), 200 if result['success'] else 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "ok", "service": "Grok 2 Image Generator API"})
+
+@app.route('/images/<path:image_name>', methods=['GET'])
+def serve_generated_image(image_name):
+    """Serve images from generated_images directory"""
+    images_dir = os.path.join(os.getcwd(), "generated_images")
     try:
-        generator = GrokImageGenerator()
-        result = generator.generate_images(prompt, count, format_type, save_images)
+        # Prevent directory traversal
+        safe_path = os.path.normpath(os.path.join(images_dir, image_name))
+        if not safe_path.startswith(os.path.abspath(images_dir)):
+            return jsonify({"error": "Invalid file path"}), 400
         
-        return jsonify(result), 200
+        if not os.path.exists(safe_path):
+            return jsonify({"error": "Image not found"}), 404
+        
+        return send_from_directory(images_dir, image_name, mimetype='image/jpeg')
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({"error": f"Error serving image: {str(e)}"}), 500
 
 def api_server_mode():
     """Run the application as a Flask API server"""
-    app = Flask(__name__)
-    generator = GrokImageGenerator()
-    
-    @app.route('/generate-image', methods=['POST'])
-    def generate_image():
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON"}), 400
-        
-        data = request.get_json()
-        
-        if 'prompt' not in data:
-            return jsonify({"error": "Prompt is required"}), 400
-        
-        prompt = data.get('prompt')
-        count = min(max(1, data.get('count', 1)), 10)  # Between 1-10
-        format_type = data.get('format', 'url')
-        if format_type not in ['url', 'b64_json']:
-            format_type = 'url'
-        
-        save_images = data.get('save_images', True)
-        
-        result = generator.generate_images(
-            prompt=prompt,
-            count=count,
-            format_type=format_type,
-            save_images=save_images
-        )
-        
-        return jsonify(result)
-    
-    @app.route('/health', methods=['GET'])
-    def health_check():
-        return jsonify({"status": "ok", "service": "Grok 2 Image Generator API"})
-    
     print("🚀 Starting Grok Image Generator API server on port 8081")
     app.run(host='0.0.0.0', port=8081, debug=False)
 
@@ -382,7 +384,6 @@ if __name__ == "__main__":
     print("🎨 Grok 2 Image Generator")
     print("========================")
     
-    # Check if command line arguments are provided
     if len(sys.argv) > 1:
         if sys.argv[1] == "api":
             api_server_mode()
